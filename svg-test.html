@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+<style>
+    circle:hover {
+        fill:red;
+    }
+    svg.display {
+        border: 1px solid cyan;
+        transform-origin: top left;
+        background-color: white;
+    }
+    body {
+        margin: 20px;
+        margin-top: 40px;
+        background-color: gray;
+    }
+    #toolbar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        padding: 5px 20px;
+        background-color: white;
+        z-index: 100;
+    }
+    input[type="number"] {
+        width: 5ch;
+    }
+    #print {
+        display: none;
+    }
+    #shapes .control {
+        display: none;
+    }
+    #shapes .active .control, 
+    #shapes .editing .control, 
+    #shapes .preview .control {
+        display: block;
+    }
+    #print #shapes .active .control,
+    #print #shapes .editing .control,
+    #print #shapes .preview .control {
+        display: none;
+    }
+    #grid{
+        z-index: -100;
+    }
+    
+    @media print {
+        body {
+            margin: 0;
+            background-color: transparent;
+        }
+        svg.display, #toolbar {
+            display: none;
+        }
+        #print {
+            display: block;
+        }
+    }
+</style>
+<style id="pagedMedia">
+</style>
+<body>
+    <div id="toolbar">
+        <label for="zoom">Zoom</label>
+        <input id="zoom" value="1" type="number">
+        <label for="horizontalPages">horizontal pages</label>
+        <input id="horizontalPages" value="1" type="number">
+        <label for="verticalPages">vertical pages</label>
+        <input id="verticalPages" value="1" type="number">
+        <button id="printBtn">Print</button>
+        <label for="gridToggle">show grid</label>
+        <input id="gridToggle" type="checkbox">
+        <select id="format">
+        </select>
+    </div>
+    <svg class="display" viewBox="0 0 0 0" xmlns="http://www.w3.org/2000/svg">
+        <g id="shapes"></g>
+    </svg>
+    <div id="print"></div>
+</body>
+<script>
+
+    /*
+    Features:
+    + measurements
+    + closing shapes
+    + mirroring
+    + exact printing
+        -  A4: 210 × 297 mm 
+    + types of edges
+    + circles
+
+    # look at milimeter collision and printTolerance for print
+    # grid is displayed when switching format & adding pages although toggled off
+    */
+
+    const formats = {
+        "A4 portrait": {
+            width: 210,
+            height: 297,
+            name: "A4",
+        },
+        "A4 landscape": {
+            width: 297,
+            height: 210,
+            name: "A4 Landscape",
+        },
+        "A3 portrait": {
+            width: 297,
+            height: 420,
+            name: "A3",
+        },
+        "A3 landscape": {
+            width: 420,
+            height: 297,
+            name: "A3 Landscape",
+        }
+    }
+
+    const precision = 0; // Prescision of coords
+    
+    var currentZoom = 1; //Current Zoom Level
+    var currentFormat = "A4 portrait"; //Current Page Format
+    var horizontalPages = 1; //Number of horizontal Pages
+    var verticalPages = 1; //Number of vertical Pages
+    var editing = null;  // Is user editing a point? 
+    var points = []; //Array of all points
+    var svg = document.querySelector('svg.display'); //Display SVG
+    var svgShapes = document.querySelector('svg.display #shapes');
+    const printTolerance = 0.5; //Print tolerance
+    var printMargin = 5; //Print Page margin in mm
+    var gridShown = false;
+    var shapes = {};
+    const strokeWidth = 0.25;
+    const pointRadius = 0.5;
+    var mouseHeld = false;
+    var editingShape = null;
+    var activeShape = null;
+    var shapeCounter = 0;
+
+    //Initialization
+    setDisplayDimensions();
+    var grid = drawGrid();
+   
+    // Get point in global SVG space
+    function cursorPoint(evt){
+        let pt = svg.createSVGPoint();
+        pt.x = evt.clientX; pt.y = evt.clientY;
+        pt = pt.matrixTransform(svg.getScreenCTM().inverse());
+        pt.x = pt.x.toFixed(precision); pt.y = pt.y.toFixed(precision);
+        return pt;
+    }
+
+    function createPoint(x, y, id, r, attr) {
+        let point = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        point.setAttribute("id", id);
+        point.setAttribute("cx", x);
+        point.setAttribute("cy", y);
+        point.setAttribute("r", r || pointRadius);
+        point.classList.add("control");
+        if (attr) {
+            let attrKeys = Object.keys(attr);
+            for (let i = 0; i < attrKeys.length; i++) {
+                point.setAttribute(attrKeys[i], attr[attrKeys[i]]);
+            }
+        }
+        return point;
+    }
+    function createLine(x1, y1, x2, y2, id, color, width, attr) {
+        let line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            line.setAttribute("id", id);
+            line.setAttribute("x1", x1);
+            line.setAttribute("y1", y1);
+            line.setAttribute("x2", x2);
+            line.setAttribute("y2", y2);
+            line.setAttribute("stroke", color || "black");
+            line.setAttribute("stroke-width", width || strokeWidth);
+            line.classList.add("control");
+            if (attr) {
+                let attrKeys = Object.keys(attr);
+                for (let i = 0; i < attrKeys.length; i++) {
+                    line.setAttribute(attrKeys[i], attr[attrKeys[i]]);
+                }
+            }
+            return line;
+    }
+
+    class Point {
+        constructor(x, y, parent, num) {
+            this.x = x;
+            this.y = y;
+            if (parent) this.parent = parent;
+            if (num) this.num = num;
+        }
+        create() {
+            return createPoint(this.x, this.y, `${this.parent.id}-p-${this.num}`);
+        }
+        draw() {
+            svgShapes.appendChild(this.create());
+        }
+    }
+
+    class QPoint {
+        constructor(x, y, x1, y1, parent, num, xo, yo,) {
+            this.x1 = x1;
+            this.y1 = y1;
+            this.x = x;
+            this.y = y;
+            this.xo = xo;
+            this.yo = yo;
+            if (parent) this.parent = parent;
+            if (num) this.num = num;
+        }
+        create() {
+            let pointCont = document.createElementNS("http://www.w3.org/2000/svg", "g");
+            pointCont.setAttribute("id", `${this.parent.id}-p-${this.num}`);
+            //point
+            pointCont.appendChild(createPoint(
+                this.x, 
+                this.y
+            ));
+            
+            //connectors
+            pointCont.appendChild(createLine(
+                this.xo,
+                this.yo, 
+                this.x1, 
+                this.y1, 
+                `${this.parent.id}-cp-${this.num}-line1`, 
+                "black",
+                strokeWidth / 2,
+                {"stroke-dasharray": "1, 1"}
+            ));
+            pointCont.appendChild(createLine(
+                this.x, 
+                this.y, 
+                this.x1, 
+                this.y1, 
+                `${this.parent.id}-cp-${this.num}-line2`, 
+                "black",
+                strokeWidth / 2,
+                {"stroke-dasharray": "1, 1"}
+            ));
+
+            //control point
+            pointCont.appendChild(createPoint(
+                this.x1, 
+                this.y1, 
+                `${this.parent.id}-cp-${this.num}`
+            ));
+            return pointCont;
+        }
+        draw() {       
+            svgShapes.appendChild(this.create());
+        }
+    }
+    
+    
+
+    class Shape {
+        constructor() {
+            this.id = `shape-${shapeCounter}`;
+            this.active = false;
+            this.editing = true;
+        }
+    }
+
+    class Path extends Shape{
+        constructor() {
+            super();
+            this.points = []
+            this.path = "";
+            this.id = `path-${shapeCounter}`;
+            editingShape = this.id;
+            shapeCounter ++;
+            shapes[this.id] = this;
+            this.closed = false;
+            this.pointCounter = 0;
+        }
+        addPoint(x, y) {
+            this.points.push(new Point(x, y, this, this.pointCounter));
+            this.pointCounter ++;
+            this.draw();
+        } 
+        addQPoint(x, y, x1, y1) {
+            let origin = this.points[this.points.length - 1];
+            this.points.push(new QPoint(x, y, x1, y1, this, this.pointCounter, origin.x, origin.y));
+            this.pointCounter ++;
+            this.draw();
+        }
+        close() {
+            this.closed = true;
+            this.draw();
+        }
+        unclose() {
+            this.closed = false;
+            this.draw();
+        }
+        move(dx, dy) {
+            for (let i = 0; i < this.points.length; i++) {
+                let point = this.points[i];
+                point.x += dx;
+                point.y += dy;
+                if(point instanceof QPoint) {
+                    point.x1 += dx;
+                    point.y1 += dy;
+                    let lastPoint = this.points[i - 1];
+                    if (lastPoint) {
+                        point.xo = lastPoint.x;
+                        point.yo = lastPoint.y;
+                    }
+                }
+            }
+            this.draw();
+        }
+        draw() {
+            //remove previous rendition
+            let oldPath = document.getElementById(this.id);
+            if(oldPath) oldPath.remove();
+
+            let pathCont = document.createElementNS("http://www.w3.org/2000/svg", "g");
+            pathCont.setAttribute("id", this.id);
+            if (this.active) pathCont.classList.add("active");
+            if (this.editing) pathCont.classList.add("editing");
+            if (this.points.length > 0) {
+                this.path = `M ${this.points[0].x},${this.points[0].y} `;
+                pathCont.appendChild(this.points[0].create());
+                for (let i = 1; i < this.points.length; i++) {
+                    pathCont.appendChild(this.points[i].create());
+                    if (this.points[i] instanceof QPoint) {
+                        this.path += `Q ${this.points[i].x1},${this.points[i].y1} ${this.points[i].x},${this.points[i].y} `;
+                    } else if (this.points[i] instanceof Point) {
+                        this.path += `L ${this.points[i].x},${this.points[i].y} `;
+                    }
+                }
+                if(this.closed) this.path += "z";
+                let newPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                newPath.setAttribute("d", this.path);
+                newPath.setAttribute("stroke", "black");
+                newPath.setAttribute("fill", "none");
+                newPath.setAttribute("stroke-width", strokeWidth);
+                pathCont.appendChild(newPath);
+                svgShapes.appendChild(pathCont);
+            }
+        }
+        removePreview() {
+            //Remove previous preview 
+            let oldPreview = document.getElementById(this.id + "-preview");
+            if (oldPreview) oldPreview.remove();
+        }
+        drawPreview(x, y, x1, y1) {
+            this.removePreview();
+            let preview = document.createElementNS("http://www.w3.org/2000/svg", "path");
+            let previewCont = document.createElementNS("http://www.w3.org/2000/svg", "g");
+            let origin = this.points[this.points.length - 1];
+            previewCont.setAttribute("id", this.id + "-preview");
+            previewCont.classList.add("preview");
+            preview.setAttribute("stroke", "black");
+            preview.setAttribute("fill", "none");
+            preview.setAttribute("stroke-width", strokeWidth);
+            let previewPath = `M ${origin.x},${origin.y} `
+            if (x1 && y1) {
+                previewCont.appendChild(new QPoint(x, y, x1, y1, this, "preview", origin.x, origin.y).create());
+                previewPath += `Q ${x1},${y1} ${x},${y} `;
+            } else {
+                previewCont.appendChild(new Point(x, y, this, "preview").create());
+                previewPath += `L ${x},${y} `;
+            }
+            preview.setAttribute("d", previewPath);
+            previewCont.appendChild(preview);
+            svgShapes.appendChild(previewCont);
+        }
+    }
+
+    //Mouse Handlers
+
+    /*
+    while editing shape:
+    - left click = add point
+    - hold and pull left click = add curved point
+    - right click = stop editing shape
+    - ctrl click = close shape
+
+    - active shape displays its control points
+    - select active shape from layer menu
+
+    otherwise:
+        while active shape:
+        - left click:
+            - on point in active shape:
+                - point becomes Point and follows mouse, 
+                - if you click it stays 
+                - if you click and drag it becomes QPoint
+            - click & drag elsewhere: move shape as a whole
+        - double click on any point in active shape: edit shape
+        - right click
+            - on point in active shape: remove point
+            - elsewhere deactivate shape.
+        while not active shape:
+        - left click: create new shape.
+    */
+
+    var clickBegin = null;
+
+    svg.addEventListener("mousedown", (evt) => {
+        if(evt.button == 0) {
+            mouseHeld = true;
+            var loc = cursorPoint(evt);
+            clickBegin = loc;
+        }
+    });
+
+    var lastMoveLoc = null;
+    svg.addEventListener("mousemove", (evt) => {
+        if (editingShape) {
+            let loc = cursorPoint(evt);
+            if (mouseHeld) {
+                shapes[editingShape].drawPreview(clickBegin.x, clickBegin.y, loc.x, loc.y);
+            } else {
+                shapes[editingShape].drawPreview(loc.x, loc.y);
+            }
+        } else if (activeShape){
+            let loc = cursorPoint(evt);
+            let point = checkPointsInActiveShape(loc.x, loc.y);
+            if (point) {
+                setCursor("pointer");
+            } else if (mouseHeld) {
+                if (!lastMoveLoc) lastMoveLoc = clickBegin;
+                shapes[activeShape].move(loc.x - lastMoveLoc.x, loc.y - lastMoveLoc.y);
+                lastMoveLoc = loc;
+                setCursor("grabbing");
+            } else {
+                setCursor("move");
+            }
+        }
+    });
+
+    svg.addEventListener("mouseup", (evt) => {
+        mouseHeld = false;
+        var loc = cursorPoint(evt);
+        let mouseMoved = (clickBegin.x != loc.x || clickBegin.y != loc.y);
+        if(evt.button == 0) { //left click
+            if (editingShape) {
+                if (evt.ctrlKey) {
+                    shapes[editingShape].close();
+                    exitEditingShape();
+                } else {
+                    if (mouseMoved) {
+                        //mouse has moved
+                        shapes[editingShape].addQPoint(clickBegin.x, clickBegin.y, loc.x, loc.y);
+                    } else {
+                        // mouse has not moved
+                        shapes[editingShape].addPoint(loc.x, loc.y);
+                    }
+                }
+            } else if (activeShape) {
+                if (mouseMoved) {
+                    lastMoveLoc = null;
+                    setCursor("move");
+                } else {
+                    exitActiveShape();
+                }
+            } else {
+                let newShape = new Path();
+                newShape.addPoint(loc.x, loc.y)
+            }
+        } else if(evt.button == 2) { //right click
+            if (editingShape) {
+                exitEditingShape();
+            } else if (activeShape) {
+                exitActiveShape();
+            }
+        }
+    },false);
+
+    //prevent context menu
+    svg.addEventListener("contextmenu", (evt) => {
+        evt.preventDefault();
+    },false);   
+
+    
+    //Mode helpers
+    function setEditingShape(id) {
+        activeShape = null;
+        editingShape = id;
+        shapes[editingShape].editing = true;
+        shapes[editingShape].draw();
+        setCursor("crosshair");
+    }
+    function setAtciveShape(id) {
+        editingShape = null;
+        activeShape = id;
+        shapes[activeShape].active = true;
+        shapes[activeShape].draw();
+        setCursor("move");
+    }
+    function exitEditingShape() {
+        if (editingShape) {
+            if (shapes[editingShape].removePreview) shapes[editingShape].removePreview();
+            shapes[editingShape].editing = false;
+            setAtciveShape(editingShape);
+        }
+    }
+    function exitActiveShape() {
+        if (activeShape) {
+            shapes[activeShape].active = false;
+            shapes[activeShape].draw();
+            activeShape = null;
+            setCursor("auto");
+        } 
+    } 
+
+    function checkPointsInActiveShape(x, y) {
+        let shape = shapes[activeShape];
+        for (let i = 0; i < shape.points.length; i++) {
+            let point = shape.points[i];
+            if(point.x == x && point.y == y) {
+                return point;
+            } else if (point instanceof QPoint && point.x1 == x && point.y1 == y) {
+                return point;
+            }
+        }
+        return null;
+    }
+    // cursor helper
+    function setCursor(type) {
+        svg.style.cursor = type;
+    }
+
+    //Grid 
+    function drawHLine(y, length, stroke, color, parent) {
+        var line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line.setAttribute("x1", 0);
+        line.setAttribute("x2", length);
+        line.setAttribute("y1", y);
+        line.setAttribute("y2", y);
+        line.setAttribute("stroke", color);
+        line.setAttribute("stroke-width", stroke);
+        line.setAttribute("stoke-opacity", 0.25);
+        parent.appendChild(line);
+    }
+    function drawVLine(x, length, stroke, color, parent) {
+        var line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line.setAttribute("y1", 0);
+        line.setAttribute("y2", length);
+        line.setAttribute("x1", x);
+        line.setAttribute("x2", x);
+        line.setAttribute("stroke", color);
+        line.setAttribute("stroke-width", stroke);
+        line.setAttribute("stoke-opacity", 0.25);
+        parent.appendChild(line);
+    }
+    function drawGrid() {
+        var grid = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        grid.setAttribute("id", "grid");
+        let width =  calculateDisplayWidth();
+        let height = calculateDisplayHeight();
+        for (let i = 1; (i < width | i < height); i++) {
+            if (i % 10 == 0) {
+                if(i < height) drawHLine(i, width, 0.1, "black", grid);
+                if(i < width) drawVLine(i, height, 0.1, "black", grid);
+            } else {
+                if(i < height) drawHLine(i, width, 0.1, "gray", grid);
+                if(i < width) drawVLine(i, height, 0.1, "gray", grid);
+            }
+        }
+        return grid;
+    }
+    //Grid toggle
+    document.getElementById("gridToggle").addEventListener("change", (evt) => {
+        if (evt.target.checked) {
+            svg.prepend(grid);
+            gridShown = true;
+        } else {
+            document.getElementById("grid").remove();
+            gridShown = false;
+        }
+    }, false);
+    function refreshGrid() {
+        let oldGrid = document.getElementById("grid");
+        if(oldGrid) oldGrid.remove();
+        grid = drawGrid();
+        if (gridShown) svg.prepend(grid);
+    }
+
+    //Format & Print
+    function calculateDisplayWidth() {
+        return formats[currentFormat].width * horizontalPages - horizontalPages * 2 * (printMargin + printTolerance);
+    }
+    function calculateDisplayHeight() {
+        return formats[currentFormat].height * verticalPages - verticalPages * 2 * (printMargin + printTolerance);
+    }
+    function setDisplayDimensions() {       
+        let width =  calculateDisplayWidth();
+        let height = calculateDisplayHeight();
+        svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+        svg.style.width = width + "mm";
+        svg.style.height = height + "mm";
+        svg.style.transform = `scale(${currentZoom})`;
+    }
+    function generatePrint() {
+        var width = formats[currentFormat].width - 2 * (printMargin + printTolerance);
+        var height = formats[currentFormat].height - 2 * (printMargin + printTolerance);
+        var printCont = document.getElementById("print");
+        printCont.innerHTML = "";
+        printCont.style.width = width + "mm";
+        for (let iX = 0; iX < horizontalPages; iX++) {
+            printCont.appendChild(createPrintSvg(iX * width, 0, width, height));
+            for (let iY = 1; iY < verticalPages; iY++) {
+                printCont.appendChild(createPrintSvg(iX * width, iY * height, width, height));
+            }
+        }
+        let pagedMedia = document.getElementById("pagedMedia");
+        pagedMedia.innerHTML = `@page{margin:${printMargin}mm;size:${currentFormat}}`
+    }
+    function createPrintSvg(minX, minY, width, height) {
+        var printSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        printSvg.classList.add("print");
+        printSvg.setAttribute("viewBox", `${minX} ${minY} ${width} ${height}`);
+        printSvg.style.width = width + "mm";
+        printSvg.style.height = height + "mm";
+        printSvg.innerHTML = svg.innerHTML;
+        return printSvg;
+    }
+
+    //Misc. UI Listeners
+    //Cange in horizontal pages
+    document.getElementById("horizontalPages").addEventListener("change", (evt) => {
+        horizontalPages = evt.target.value;
+        setDisplayDimensions();
+        generatePrint();
+        refreshGrid();
+    }, false);
+    //Cange in vertical pages
+    document.getElementById("verticalPages").addEventListener("change", (evt) => {
+        verticalPages = evt.target.value;
+        setDisplayDimensions();
+        generatePrint();
+        refreshGrid();
+    }, false);
+    //Zoom change
+    document.getElementById("zoom").addEventListener("change", (evt) => {
+        currentZoom = evt.target.value;
+        setDisplayDimensions();
+    }, false);
+    //Print button
+    document.getElementById("printBtn").addEventListener("click", (evt) => {
+        generatePrint();
+        window.print(svg);
+    }, false);
+    window.addEventListener("beforeprint", (evt) => {
+        generatePrint();
+    }, false);
+    //Format Select
+    var select = document.getElementById("format");
+    function populateFormatSelect() {
+        let keys = Object.keys(formats);
+        for (let i = 0; i < keys.length; i++) {
+            let option = document.createElement("option");
+            option.setAttribute("value", keys[i]);
+            option.innerHTML = formats[keys[i]].name;
+            select.appendChild(option);
+        }
+    }
+    populateFormatSelect();
+    select.addEventListener("change", (evt) => {
+        currentFormat = evt.target.value;
+        setDisplayDimensions();
+        generatePrint();
+        refreshGrid();
+    }, false)
+</script>
+</html>
